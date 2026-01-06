@@ -27,7 +27,7 @@ use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_dis
 use crate::disk::fs::{
     O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename,
 };
-use crate::disk::os::{check_path_length, is_empty_dir};
+use crate::disk::os::{check_path_length, is_empty_dir, is_empty_dir_except_xlmeta};
 use crate::disk::{
     CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN, CHECK_PART_VOLUME_NOT_FOUND,
     FileReader, RUSTFS_META_TMP_DELETED_BUCKET, conv_part_err_to_int,
@@ -35,8 +35,8 @@ use crate::disk::{
 use crate::disk::{FileWriter, STORAGE_FORMAT_FILE};
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use rustfs_utils::path::{
-    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, decode_dir_object, encode_dir_object, has_suffix,
-    path_join, path_join_buf,
+    GLOBAL_DIR_SUFFIX, GLOBAL_DIR_SUFFIX_WITH_SLASH, SLASH_SEPARATOR, clean, encode_dir_object, has_suffix, path_join,
+    path_join_buf,
 };
 use tokio::time::interval;
 
@@ -1005,8 +1005,6 @@ impl LocalDisk {
 
         current = current.trim_matches('/').to_owned();
 
-        let bucket = opts.bucket.as_str();
-
         let mut dir_objes = HashSet::new();
 
         // First-level filtering
@@ -1044,29 +1042,15 @@ impl LocalDisk {
             *item = "".to_owned();
 
             if entry.ends_with(STORAGE_FORMAT_FILE) {
-                let metadata = self
-                    .read_metadata(self.get_object_path(bucket, format!("{}/{}", &current, &entry).as_str())?)
-                    .await?;
-
-                let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
-                let name = entry.trim_end_matches(SLASH_SEPARATOR);
-                let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
-
-                // if opts.limit > 0
-                //     && let Ok(meta) = FileMeta::load(&metadata)
-                //     && !meta.all_hidden(true)
-                // {
-                *objs_returned += 1;
-                // }
-
-                out.write_obj(&MetaCacheEntry {
-                    name: name.clone(),
-                    metadata,
-                    ..Default::default()
-                })
-                .await?;
-
-                return Ok(());
+                // When xl.meta is found directly in list_dir results, it means:
+                // 1. This directory IS an object (has xl.meta)
+                // 2. We were called recursively from a parent scan_dir that already emitted this object
+                // So we should NOT emit it again here - just continue to process other entries
+                // (like subdirectories containing nested objects).
+                // Previously this returned early, which caused nested objects to be missed
+                // when an object key is also a prefix of another object
+                // (e.g., both "foo/bar" and "foo/bar/xyzzy" exist).
+                continue;
             }
         }
 
@@ -1139,11 +1123,24 @@ impl LocalDisk {
 
                     out.write_obj(&meta).await?;
 
-                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
-                    //     && !meta.all_hidden(true)
-                    // {
                     *objs_returned += 1;
-                    // }
+
+                    // When an object key is also a prefix of another object (e.g., "foo/bar"
+                    // and "foo/bar/xyzzy" both exist), the directory may contain both xl.meta
+                    // and subdirectories. We need to recursively scan for nested objects.
+                    // We call scan_dir directly here instead of adding to dir_stack because
+                    // the object was already emitted - we don't want to emit a duplicate
+                    // directory entry.
+                    if !is_dir_obj && opts.recursive {
+                        let obj_dir_path = self.get_object_path(&opts.bucket, &meta.name)?;
+                        if !is_empty_dir_except_xlmeta(&obj_dir_path).await {
+                            let mut dir_name = meta.name.clone();
+                            dir_name.push_str(SLASH_SEPARATOR);
+                            if let Err(er) = Box::pin(self.scan_dir(dir_name, prefix.clone(), opts, out, objs_returned)).await {
+                                warn!("scan_dir for nested objects err {:?}", &er);
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     if err == Error::FileNotFound || err == Error::IsNotRegular {

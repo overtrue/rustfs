@@ -96,6 +96,33 @@ pub async fn is_empty_dir(path: impl AsRef<Path>) -> bool {
     read_dir(path.as_ref(), 1).await.is_ok_and(|v| v.is_empty())
 }
 
+/// Check if an object directory contains subdirectories that may represent nested objects.
+/// Returns true if the directory is "empty" (only contains xl.meta and/or data directories),
+/// meaning no nested object directories exist.
+/// This is used when an object key might be a prefix of another object
+/// (e.g., both "foo/bar" and "foo/bar/xyzzy" exist as objects).
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn is_empty_dir_except_xlmeta(path: impl AsRef<Path>) -> bool {
+    match read_dir(path.as_ref(), 0).await {
+        Ok(entries) => {
+            // Check if there are any subdirectories that are NOT data directories (UUID-based).
+            // Data directories have names that are valid UUIDs, while nested objects have
+            // human-readable names that wouldn't be valid UUIDs.
+            !entries.iter().any(|name| {
+                // Only consider directories (entries ending with /)
+                if !name.ends_with(SLASH_SEPARATOR) {
+                    return false;
+                }
+                // Get the directory name without trailing slash
+                let dir_name = name.trim_end_matches(SLASH_SEPARATOR);
+                // If it's a valid UUID, it's a data directory, not a nested object
+                uuid::Uuid::parse_str(dir_name).is_err()
+            })
+        }
+        Err(_) => true,
+    }
+}
+
 // read_dir  count read limit. when count == 0 unlimit.
 /// Return file names in the directory.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -245,4 +272,103 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn file_exists(path: impl AsRef<Path>) -> bool {
     std::fs::metadata(path.as_ref()).map(|_| true).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::fs;
+
+    /// Test is_empty_dir_except_xlmeta for directories with various contents.
+    /// This function is used to detect if an object directory contains nested objects.
+    #[tokio::test]
+    async fn test_is_empty_dir_except_xlmeta() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        // Test 1: Empty directory should be considered "empty"
+        let empty_dir = base_path.join("empty");
+        fs::create_dir(&empty_dir).await.unwrap();
+        assert!(is_empty_dir_except_xlmeta(&empty_dir).await, "Empty directory should return true");
+
+        // Test 2: Directory with only xl.meta should be considered "empty"
+        let object_dir = base_path.join("object");
+        fs::create_dir(&object_dir).await.unwrap();
+        fs::write(object_dir.join("xl.meta"), "metadata").await.unwrap();
+        assert!(
+            is_empty_dir_except_xlmeta(&object_dir).await,
+            "Directory with only xl.meta should return true"
+        );
+
+        // Test 3: Directory with xl.meta and a UUID data directory should be "empty"
+        // (data directories use UUID names)
+        let object_with_data = base_path.join("object_with_data");
+        fs::create_dir(&object_with_data).await.unwrap();
+        fs::write(object_with_data.join("xl.meta"), "metadata").await.unwrap();
+        let data_dir = object_with_data.join("550e8400-e29b-41d4-a716-446655440000");
+        fs::create_dir(&data_dir).await.unwrap();
+        assert!(
+            is_empty_dir_except_xlmeta(&object_with_data).await,
+            "Directory with xl.meta and UUID data dir should return true"
+        );
+
+        // Test 4: Directory with xl.meta and a non-UUID subdirectory (nested object)
+        // should NOT be considered "empty"
+        let object_with_nested = base_path.join("object_with_nested");
+        fs::create_dir(&object_with_nested).await.unwrap();
+        fs::write(object_with_nested.join("xl.meta"), "metadata").await.unwrap();
+        let nested_dir = object_with_nested.join("xyzzy");
+        fs::create_dir(&nested_dir).await.unwrap();
+        assert!(
+            !is_empty_dir_except_xlmeta(&object_with_nested).await,
+            "Directory with xl.meta and non-UUID subdir should return false"
+        );
+
+        // Test 5: Non-existent directory should be considered "empty" (error case)
+        let non_existent = base_path.join("non_existent");
+        assert!(
+            is_empty_dir_except_xlmeta(&non_existent).await,
+            "Non-existent directory should return true (error case)"
+        );
+    }
+
+    /// Test that UUID-named directories are correctly identified as data directories
+    #[tokio::test]
+    async fn test_uuid_directory_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+
+        let object_dir = base_path.join("object");
+        fs::create_dir(&object_dir).await.unwrap();
+        fs::write(object_dir.join("xl.meta"), "metadata").await.unwrap();
+
+        // Various UUID formats that should be recognized as data directories
+        let uuid_dirs = [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "00000000-0000-0000-0000-000000000000",
+            "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        ];
+
+        for uuid_name in uuid_dirs {
+            let uuid_dir = object_dir.join(uuid_name);
+            fs::create_dir(&uuid_dir).await.unwrap();
+        }
+
+        // Should still be "empty" because all subdirectories are UUID data directories
+        assert!(
+            is_empty_dir_except_xlmeta(&object_dir).await,
+            "Directory with only UUID data directories should return true"
+        );
+
+        // Now add a non-UUID directory (representing a nested object)
+        let nested_object = object_dir.join("nested");
+        fs::create_dir(&nested_object).await.unwrap();
+
+        // Should now NOT be "empty" because there's a non-UUID subdirectory
+        assert!(
+            !is_empty_dir_except_xlmeta(&object_dir).await,
+            "Directory with non-UUID subdirectory should return false"
+        );
+    }
 }
